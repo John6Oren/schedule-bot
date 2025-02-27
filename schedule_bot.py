@@ -35,21 +35,75 @@ def fetch_page_with_scrapingbee(url):
         'api_key': SCRAPINGBEE_API_KEY,
         'url': url,
         'render_js': 'true',  # להריץ JavaScript בדף
-        'wait': '2000',       # לחכות 2 שניות לטעינת הדף
-        'premium_proxy': 'true'  # להשתמש בפרוקסי פרמיום למניעת חסימות
+        'wait': '5000',       # לחכות 5 שניות לטעינת הדף (הגדלנו את הזמן)
+        'premium_proxy': 'true',  # להשתמש בפרוקסי פרמיום למניעת חסימות
+        'block_resources': 'false',  # לא לחסום משאבים (לפי המלצת ScrapingBee)
+        'country_code': 'il',  # להשתמש בפרוקסי מישראל שעשוי לשפר גישה לאתר ישראלי
+        'timeout': '30000'  # להגדיל את הטיימאאוט ל-30 שניות
     }
     
     try:
-        response = requests.get('https://app.scrapingbee.com/api/v1/', params=params)
+        # נוסיף headers כדי שהבקשה תיראה כמו מדפדפן רגיל
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get('https://app.scrapingbee.com/api/v1/', params=params, headers=headers)
         logger.info(f"סטטוס תשובה מ-ScrapingBee: {response.status_code}")
         
         if response.status_code == 200:
             return response.content
         else:
             logger.error(f"שגיאה בשליפת הדף: {response.status_code} - {response.text}")
+            
+            # ניסיון שני עם פחות אפשרויות אם הראשון נכשל
+            if response.status_code == 500:
+                logger.info("מנסה שוב עם פחות אפשרויות")
+                simpler_params = {
+                    'api_key': SCRAPINGBEE_API_KEY,
+                    'url': url,
+                    'block_resources': 'false'
+                }
+                retry_response = requests.get('https://app.scrapingbee.com/api/v1/', params=simpler_params)
+                logger.info(f"סטטוס תשובה בניסיון חוזר: {retry_response.status_code}")
+                
+                if retry_response.status_code == 200:
+                    return retry_response.content
+                else:
+                    logger.error(f"גם הניסיון השני נכשל: {retry_response.status_code} - {retry_response.text}")
+            
             return None
     except Exception as e:
         logger.error(f"תקלה בשליפת הדף: {str(e)}")
+        return None
+
+# פונקציה לשליפת דף ישירות, ללא ScrapingBee
+def fetch_page_directly(url):
+    logger.info(f"מנסה לשלוף דף ישירות מ-URL: {url}")
+    
+    # הגדרת User-Agent שדומה לדפדפן רגיל
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'he,en-US;q=0.7,en;q=0.3',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        logger.info(f"סטטוס תשובה ישירה: {response.status_code}")
+        
+        if response.status_code == 200:
+            # יתכן שהתוכן מוצפן או בקידוד אחר
+            response.encoding = 'utf-8'  # נסה לקבוע את הקידוד
+            return response.content
+        else:
+            logger.error(f"שגיאה בשליפה ישירה: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"תקלה בשליפה ישירה: {str(e)}")
         return None
 
 # פונקציה לשליפת אירועים מהיומן
@@ -59,7 +113,11 @@ def fetch_schedule(url):
     # שליפת תוכן הדף באמצעות ScrapingBee
     html_content = fetch_page_with_scrapingbee(url)
     if not html_content:
-        logger.error("לא התקבל תוכן מהדף")
+        logger.warning("שליפה עם ScrapingBee נכשלה, מנסה שליפה ישירה")
+        html_content = fetch_page_directly(url)
+    
+    if not html_content:
+        logger.error("לא התקבל תוכן מהדף בשתי השיטות")
         return []
     
     # פירוק ה-HTML באמצעות BeautifulSoup
@@ -73,8 +131,25 @@ def fetch_schedule(url):
     # ניסיון מבנה אלטרנטיבי אם לא נמצאו אירועים
     if len(event_items) == 0:
         logger.info("מנסה למצוא אירועים במבנה אלטרנטיבי")
-        event_items = soup.find_all(lambda tag: tag.name == 'div' and 'event' in tag.get('class', []))
+        # חיפוש לפי מחלקות שונות שעשויות להכיל אירועים
+        event_items = soup.find_all(lambda tag: tag.name == 'div' and 
+                                   ('event' in tag.get('class', []) or 
+                                    'activity' in tag.get('class', []) or
+                                    'entry' in tag.get('class', [])))
+        
+        # חיפוש לפי מבנה אחר - אולי טבלה
+        if len(event_items) == 0:
+            table_rows = soup.find_all('tr')
+            if len(table_rows) > 1:  # יש טבלה עם לפחות שורת כותרת ושורת תוכן
+                logger.info(f"נמצאה טבלה עם {len(table_rows)} שורות, מנסה לחלץ מידע")
+                event_items = table_rows[1:]  # מתעלם משורת הכותרת
+        
         logger.info(f"נמצאו {len(event_items)} אירועים במבנה אלטרנטיבי")
+        
+        # הצגת HTML לדיבוג אם לא נמצאו אירועים
+        if len(event_items) == 0:
+            sample_html = str(soup)[:500] + "..." if len(str(soup)) > 500 else str(soup)
+            logger.debug(f"דוגמה מה-HTML שהתקבל: {sample_html}")
     
     for event in event_items:
         try:
@@ -237,11 +312,85 @@ def create_message(events, team_name):
     
     return message, filtered_events
 
-# ריצת הבוט לקבלת לוח האירועים
+# נתונים לדוגמה במקרה שהשליפה נכשלת
+def get_sample_events(team_name):
+    logger.info(f"יוצר נתונים לדוגמה עבור {team_name}")
+    
+    today = datetime.now()
+    events = []
+    
+    if team_name == "נערות א על":
+        # אימונים ומשחקים לדוגמה לנערות א על
+        events = [
+            {
+                "team": "נערות א על",
+                "date": today + timedelta(days=1),  # מחר
+                "time": "17:30",
+                "location": "אולם גן נר",
+                "is_game": False,
+                "opponent": None,
+                "home_away": None
+            },
+            {
+                "team": "נערות א על",
+                "date": today + timedelta(days=3),  # בעוד 3 ימים
+                "time": "19:00",
+                "location": "אולם גן נר",
+                "is_game": True,
+                "opponent": "אליצור חולון",
+                "home_away": "בית"
+            },
+            {
+                "team": "נערות א על",
+                "date": today + timedelta(days=5),  # בעוד 5 ימים
+                "time": "17:30",
+                "location": "אולם גן נר",
+                "is_game": False,
+                "opponent": None,
+                "home_away": None
+            }
+        ]
+    elif team_name == "נשים לאומית":
+        # אימונים ומשחקים לדוגמה לנשים לאומית
+        events = [
+            {
+                "team": "נשים לאומית",
+                "date": today + timedelta(days=2),  # בעוד יומיים
+                "time": "20:00",
+                "location": "אולם גן נר",
+                "is_game": False,
+                "opponent": None,
+                "home_away": None
+            },
+            {
+                "team": "נשים לאומית",
+                "date": today + timedelta(days=4),  # בעוד 4 ימים
+                "time": "19:30",
+                "location": "אולם עפולה",
+                "is_game": True,
+                "opponent": "מכבי רעננה",
+                "home_away": "חוץ"
+            },
+            {
+                "team": "נשים לאומית",
+                "date": today + timedelta(days=6),  # בעוד 6 ימים
+                "time": "20:00",
+                "location": "אולם גן נר",
+                "is_game": False,
+                "opponent": None,
+                "home_away": None
+            }
+        ]
+    
+    return events
+
 def get_schedule_for_team(team_name):
     logger.info(f"משיג לוח זמנים לקבוצת {team_name}")
     
     try:
+        # מידע לדוגמה במקרה שהשליפה נכשלת
+        sample_events = get_sample_events(team_name)
+        
         # שליפת נתונים מהיומנים
         training_events = fetch_schedule(TRAININGS_URL)
         game_events = fetch_schedule(GAMES_URL)
@@ -251,6 +400,11 @@ def get_schedule_for_team(team_name):
         
         logger.info(f"נמצאו {len(all_events)} אירועים רלוונטיים בסך הכל")
         
+        # אם לא נמצאו אירועים אמיתיים, השתמש במידע לדוגמה
+        if len(all_events) == 0:
+            logger.warning(f"לא נמצאו אירועים אמיתיים, משתמש במידע לדוגמה")
+            all_events = sample_events
+        
         # יצירת ההודעה והאירועים המסוננים
         message, filtered_events = create_message(all_events, team_name)
         
@@ -258,7 +412,8 @@ def get_schedule_for_team(team_name):
             "message": message,
             "events": filtered_events,
             "total_events": len(filtered_events),
-            "success": True
+            "success": True,
+            "source": "real" if len(training_events) + len(game_events) > 0 else "sample"
         }
     except Exception as e:
         logger.error(f"שגיאה בהשגת לוח זמנים: {str(e)}")
@@ -523,6 +678,7 @@ def home():
                                 `<h3>מידע טכני:</h3>
                                  <p>מספר אירועים שנמצאו: ${data.total_events}</p>
                                  <p>סטטוס: ${data.success ? 'הצלחה' : 'שגיאה'}</p>
+                                 <p>מקור: ${data.source === 'sample' ? 'נתוני דוגמה' : 'נתונים אמיתיים'}</p>
                                  <pre>${JSON.stringify(data.events || [], null, 2)}</pre>`;
                         } else {
                             showAlert(`שגיאה בטעינת הלוח: ${data.message}`, 'danger');
@@ -580,6 +736,11 @@ def get_schedule_route(team_name):
         })
     
     result = get_schedule_for_team(team_name)
+    
+    # הודע על שימוש בנתונים לדוגמה
+    if result.get("source") == "sample":
+        result["message"] = "(דוגמה בלבד - לא התקבלו נתונים מהאתר)\n\n" + result["message"]
+    
     return json.dumps(result, default=lambda obj: obj.isoformat() if isinstance(obj, datetime) else str(obj))
 
 if __name__ == "__main__":
